@@ -274,51 +274,43 @@ jobs:
           Register-ScheduledTask -TaskName "KeepScreenAliveTask" -Action $action -Trigger $trigger -Principal $principal -Force
           Start-ScheduledTask -TaskName "KeepScreenAliveTask"
 
-      - name: Install & Connect ngrok
-        env:
-          NGROK_AUTH_TOKEN: ${{ secrets.NGROK_AUTH_TOKEN }}
+      - name: Install & Connect Free Tunnel (Bore)
         run: |
-          if ([string]::IsNullOrWhiteSpace($env:NGROK_AUTH_TOKEN)) {
-              Write-Error "NGROK_AUTH_TOKEN secret is missing."
-              exit 1
-          }
-
-          Write-Host "Downloading and installing ngrok manually..."
-          $ngrokZip = "$env:TEMP\ngrok.zip"
-          $ngrokDir = "C:\ngrok"
-          New-Item -ItemType Directory -Path $ngrokDir -Force | Out-Null
-
-          # Download official ngrok Windows 64-bit binary directly
+          Write-Host "Downloading Bore (Free TCP Tunnel - No Account Needed)..."
+          $boreZip = "$env:TEMP\bore.zip"
+          $boreDir = "C:\bore"
+          New-Item -ItemType Directory -Path $boreDir -Force | Out-Null
+          
+          # Download official bore Windows 64-bit binary
           [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-          Invoke-WebRequest -Uri "https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-windows-amd64.zip" -OutFile $ngrokZip
-          Expand-Archive -Path $ngrokZip -DestinationPath $ngrokDir -Force
-
-          # Configure authtoken using the explicit executable path
-          & "$ngrokDir\ngrok.exe" config add-authtoken $env:NGROK_AUTH_TOKEN
-
-          Write-Host "Starting ngrok TCP tunnel for port 3389..."
-          Start-Process -FilePath "$ngrokDir\ngrok.exe" -ArgumentList "tcp 3389" -NoNewWindow
-
-          $ngrokTcp = ""
+          Invoke-WebRequest -Uri "https://github.com/ekzhang/bore/releases/download/v0.5.1/bore-v0.5.1-x86_64-pc-windows-msvc.zip" -OutFile $boreZip
+          Expand-Archive -Path $boreZip -DestinationPath $boreDir -Force
+          
+          Write-Host "Starting Bore TCP tunnel for RDP (port 3389)..."
+          Start-Process -FilePath "$boreDir\bore.exe" -ArgumentList "local 3389 --to bore.pub" -NoNewWindow -RedirectStandardOutput "$boreDir\bore.log" -RedirectStandardError "$boreDir\bore_err.log"
+          
+          $tunnelAddress = ""
           for ($i = 1; $i -le 15; $i++) {
-              try {
-                  $response = Invoke-RestMethod -Uri "http://127.0.0.1:4040/api/tunnels" -ErrorAction SilentlyContinue
-                  $tunnel = $response.tunnels | Where-Object { $_.proto -eq "tcp" } | Select-Object -First 1
-                  if ($tunnel) {
-                      $ngrokTcp = $tunnel.public_url
+              Start-Sleep -Seconds 2
+              if (Test-Path "$boreDir\bore.log") {
+                  $logContent = Get-Content "$boreDir\bore.log" -Raw
+                  # Look for the assigned port in the logs
+                  if ($logContent -match "listening at (bore\.pub:\d+)") {
+                      $tunnelAddress = $matches[1]
                       break
                   }
-              } catch {}
-              Start-Sleep -Seconds 2
+              }
           }
-
-          if (-not $ngrokTcp) {
-              Write-Error "Failed to retrieve ngrok TCP tunnel address."
+          
+          if (-not $tunnelAddress) {
+              Write-Error "Failed to retrieve Bore TCP tunnel address. The public server might be full."
               exit 1
           }
-
-          Write-Host "ngrok Tunnel Established: $ngrokTcp"
-          "NGROK_TCP=$ngrokTcp" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          
+          Write-Host "Free Tunnel Established: $tunnelAddress"
+          
+          # Pass the address to the final step (keeping the NGROK_TCP variable name so your next step still works)
+          "NGROK_TCP=$tunnelAddress" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           
       - name: Maintain Active Runner Loop
         env:
