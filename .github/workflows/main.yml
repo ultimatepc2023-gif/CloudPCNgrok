@@ -288,15 +288,12 @@ jobs:
           $ngrokDir = "C:\ngrok"
           New-Item -ItemType Directory -Path $ngrokDir -Force | Out-Null
 
-          # Download official ngrok Windows 64-bit binary
+          # Download official ngrok Windows 64-bit binary directly
           [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
           Invoke-WebRequest -Uri "https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-windows-amd64.zip" -OutFile $ngrokZip
           Expand-Archive -Path $ngrokZip -DestinationPath $ngrokDir -Force
 
-          # Add ngrok to process PATH
-          $env:Path += ";$ngrokDir"
-
-          # Configure authtoken
+          # Configure authtoken using the explicit executable path
           & "$ngrokDir\ngrok.exe" config add-authtoken $env:NGROK_AUTH_TOKEN
 
           Write-Host "Starting ngrok TCP tunnel for port 3389..."
