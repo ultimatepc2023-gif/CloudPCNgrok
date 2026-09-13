@@ -1,0 +1,345 @@
+name: Cloud PC
+
+on:
+  repository_dispatch:
+    types: [Cloud PC]
+  workflow_dispatch:
+
+jobs:
+  CloudPC:
+    runs-on: windows-latest
+    timeout-minutes: 3600
+
+    steps:
+      - name: Configure Core RDP, Timezone, Display, Audio & Edge Protocols
+        run: |
+          # Set System Time Zone securely via Secret
+          $tz = "${{ secrets.RDP_TIMEZONE }}"
+          if (-not [string]::IsNullOrWhiteSpace($tz)) {
+              Set-TimeZone -Id $tz
+          }
+
+          # Edge AutoLaunch Protocol Policy for Zoom (Expanded Origins)
+          $zoomOrigins = '[{"allowed_origins":["https://zoom.us","https://www.zoom.us","https://us02web.zoom.us","https://us03web.zoom.us","https://us04web.zoom.us","https://us05web.zoom.us","https://us06web.zoom.us","https://us07web.zoom.us","https://us08web.zoom.us","https://us09web.zoom.us","https://us10web.zoom.us","https://us11web.zoom.us","https://us12web.zoom.us","https://us13web.zoom.us","https://us14web.zoom.us","https://us15web.zoom.us","https://us16web.zoom.us","https://us17web.zoom.us","https://us18web.zoom.us","https://us19web.zoom.us","https://us20web.zoom.us"],"protocol":"zoommtg"}]'
+
+          New-Item -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Edge' -Force | Out-Null
+          Set-ItemProperty -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Edge' -Name 'AutoLaunchProtocolsFromOrigins' -Type String -Value $zoomOrigins -Force
+
+          # Enable RDP & Firewall
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop" -ErrorAction SilentlyContinue
+
+          Set-ItemProperty -Path "HKCU:\Control Panel\Accessibility\StickyKeys" -Name "Flags" -Value "506"
+          $path = "HKCU:\Control Panel\Accessibility\StickyKeys"
+          New-Item -Path $path -Force | Out-Null
+          Set-ItemProperty -Path $path -Name "Flags" -Value "58" -Type String
+          $path2 = "HKCU:\Control Panel\Accessibility\Keyboard Response"
+          New-Item -Path $path2 -Force | Out-Null
+          Set-ItemProperty -Path $path2 -Name "Flags" -Value "122" -Type String
+
+          # Force Remote Desktop active display buffer
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "MaxInstanceCount" -Value 100 -Force
+
+          # Enable RDP Audio Redirection in Registry
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "fDisableCam" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "fDisableAudioCapture" -Value 0 -Force
+
+          $policyPath = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services'
+          if (-not (Test-Path $policyPath)) { New-Item -Path $policyPath -Force | Out-Null }
+          Set-ItemProperty -Path $policyPath -Name "fDisableAudioCapture" -Value 0 -Type DWord -Force
+
+          # Enable Windows Audio Services
+          Set-Service -Name "AudioSrv" -StartupType Automatic
+          Start-Service -Name "AudioSrv" -ErrorAction SilentlyContinue
+          Set-Service -Name "AudioEndpointBuilder" -StartupType Automatic
+          Start-Service -Name "AudioEndpointBuilder" -ErrorAction SilentlyContinue
+
+          # Prevent power down or screen timeout
+          powercfg /change monitor-timeout-ac 0
+          powercfg /change standby-timeout-ac 0
+          powercfg /change disk-timeout-ac 0
+
+          # Restart TermService
+          Restart-Service -Name TermService -Force
+
+      - name: Create RDP User & Security Policies
+        run: |
+          $userName = "${{ secrets.RDP_USER }}"
+          $password = "${{ secrets.RDP_PASSWORD }}"
+
+          if ([string]::IsNullOrWhiteSpace($userName) -or [string]::IsNullOrWhiteSpace($password)) {
+              Write-Error "RDP_USER or RDP_PASSWORD secret is missing."
+              exit 1
+          }
+
+          Write-Host "::add-mask::$password"
+          Write-Host "::add-mask::$userName"
+
+          # Disable local password complexity
+          secedit /export /cfg "$env:TEMP\secpol.cfg"
+          $cfgContent = Get-Content "$env:TEMP\secpol.cfg"
+          $cfgContent = $cfgContent -replace 'PasswordComplexity = 1', 'PasswordComplexity = 0'
+          $cfgContent = $cfgContent -replace 'MinimumPasswordLength = \d+', 'MinimumPasswordLength = 0'
+          $cfgContent | Out-File -Encoding ascii "$env:TEMP\secpol.cfg"
+          secedit /configure /db "$env:TEMP\secpol.sdb" /cfg "$env:TEMP\secpol.cfg" /areas SECURITYPOLICY
+
+          # Create Account
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+          New-LocalUser -Name $userName -Password $securePass -AccountNeverExpires -ErrorAction SilentlyContinue
+          net user "$userName" "$password"
+
+          Add-LocalGroupMember -Group "Administrators" -Member $userName -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member $userName -ErrorAction SilentlyContinue
+
+          # Infinite session duration & disable lock screen
+          $policyPath = 'HKLM:\SOFTWARE\Policies\Microsoft\WindowsPersonalization'
+          if (-not (Test-Path $policyPath)) { New-Item -Path $policyPath -Force | Out-Null }
+          Set-ItemProperty -Path $policyPath -Name "NoLockScreen" -Value 1 -Type DWord -Force
+
+          $tsPath = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services'
+          if (-not (Test-Path $tsPath)) { New-Item -Path $tsPath -Force | Out-Null }
+          Set-ItemProperty -Path $tsPath -Name "MaxIdleTime" -Value 0 -Type DWord -Force
+          Set-ItemProperty -Path $tsPath -Name "MaxDisconnectionTime" -Value 0 -Type DWord -Force
+          Set-ItemProperty -Path $tsPath -Name "RemoteAppLogoffTimeout" -Value 0 -Type DWord -Force
+
+      - name: Install Virtual Display & Virtual Audio Driver
+        run: |
+          # --- 1. Install Virtual Display Driver ---
+          $driverZip = "$env:TEMP\usbmmidd.zip"
+          $driverDir = "C:\VirtualDisplay"
+          New-Item -ItemType Directory -Path $driverDir -Force | Out-Null
+
+          $urls = @(
+              "https://raw.githubusercontent.com/roshkins/IddSampleDriver/main/usbmmidd_v2.zip",
+              "https://www.amyuni.com/downloads/usbmmidd_v2.zip"
+          )
+
+          foreach ($url in $urls) {
+              try {
+                  [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+                  curl.exe -sSL "$url" -o "$driverZip"
+                  if ((Test-Path $driverZip) -and (Get-Item $driverZip).Length -gt 1000) { break }
+              } catch {}
+          }
+
+          if (Test-Path $driverZip) {
+              Expand-Archive -Path $driverZip -DestinationPath $driverDir -Force
+              $installer = Get-ChildItem -Path $driverDir -Recurse -Filter "deviceinstaller64.exe" | Select-Object -First 1
+              if ($installer) {
+                  Set-Location $installer.DirectoryName
+                  & .\deviceinstaller64.exe install usbmmidd.inf usbmmidd
+                  & .\deviceinstaller64.exe enableidd 1
+              }
+          }
+
+          # --- 2. Silent Non-Blocking Virtual Audio Driver ---
+          try {
+              $audioZip = "$env:TEMP\VBCABLE.zip"
+              $audioDir = "C:\VirtualAudio"
+              New-Item -ItemType Directory -Path $audioDir -Force | Out-Null
+
+              $audioUrl = "https://download.vb-audio.com/Download_ZIP/VBCABLE_Driver_Pack43.zip"
+              curl.exe -sSL "$audioUrl" -o "$audioZip"
+              Expand-Archive -Path $audioZip -DestinationPath $audioDir -Force
+
+              $infPath = Join-Path $audioDir "vbcable_x64.inf"
+              if (Test-Path $infPath) {
+                  pnputil.exe /add-driver "$infPath" /install
+                  Write-Host "Virtual Audio Driver installed via pnputil without hanging."
+              }
+          } catch {
+              Write-Warning "Failed installing Virtual Audio Driver: $($_.Exception.Message)"
+          }
+
+      - name: Install Software (OBS, Zoom, AutoHotkey & Python Packages)
+        run: |
+          winget source update
+          winget install --id OBSProject.OBSStudio --exact --source winget --accept-source-agreements --accept-package-agreements
+          winget install --id Zoom.Zoom -e --source winget --accept-source-agreements --accept-package-agreements
+          winget install --id AutoHotkey.AutoHotkey --exact --accept-source-agreements --accept-package-agreements
+
+          # Install Python & required packages
+          python -m pip install --upgrade pip
+          pip install pynput pyautogui requests requests-toolbelt
+
+      - name: Configure Cloud Directory & Auto Tasks
+        env:
+          LOGIN_NAME: ${{ secrets.LOGIN_NAME }}
+          LOGIN_FILE: ${{ secrets.LOGIN_FILE }}
+          LOGIN_URL: ${{ secrets.LOGIN_URL }}
+          LOGIN_TIME: ${{ secrets.LOGIN_TIME }}
+          OBS_NAME: ${{ secrets.OBS_NAME }}
+          OBS_FILE: ${{ secrets.OBS_FILE }}
+          OBS_URL: ${{ secrets.OBS_URL }}
+          OBS_TIME: ${{ secrets.OBS_TIME }}
+          AHK_NAME: ${{ secrets.AHK_NAME }}
+          AHK_FILE: ${{ secrets.AHK_FILE }}
+          AHK_URL: ${{ secrets.AHK_URL }}
+          AHK_TIME: ${{ secrets.AHK_TIME }}
+          UPLOAD_NAME: ${{ secrets.UPLOAD_NAME }}
+          UPLOAD_FILE: ${{ secrets.UPLOAD_FILE }}
+          UPLOAD_URL: ${{ secrets.UPLOAD_URL }}
+          UPLOAD_TIME: ${{ secrets.UPLOAD_TIME }}
+          RDP_USER: ${{ secrets.RDP_USER }}
+        run: |
+          New-Item -ItemType Directory -Path "C:\Cloud" -Force | Out-Null
+
+          function Get-TargetFilePath ([string]$inputPath) {
+              $fileName = [System.IO.Path]::GetFileName($inputPath)
+              return "C:\Cloud\$fileName"
+          }
+
+          $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Hours 12)
+
+          # --- 1. Download and Schedule OBS Task ---
+          if (-not [string]::IsNullOrWhiteSpace($env:OBS_URL) -and -not [string]::IsNullOrWhiteSpace($env:OBS_TIME) -and -not [string]::IsNullOrWhiteSpace($env:OBS_FILE) -and -not [string]::IsNullOrWhiteSpace($env:OBS_NAME)) {
+              $obsDest = Get-TargetFilePath $env:OBS_FILE
+              try {
+                  Invoke-WebRequest -Uri $env:OBS_URL -OutFile $obsDest
+                  $action  = New-ScheduledTaskAction -Execute "python" -Argument "`"$obsDest`"" -WorkingDirectory "C:\Cloud"
+                  $trigger = New-ScheduledTaskTrigger -Daily -At $env:OBS_TIME
+                  $principal = New-ScheduledTaskPrincipal -UserId "$env:RDP_USER" -LogonType Interactive -RunLevel Highest
+                  Register-ScheduledTask -TaskName $env:OBS_NAME -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force
+              } catch {
+                  Write-Warning "Failed setting up OBS Task: $($_.Exception.Message)"
+              }
+          }
+
+          # --- 2. Download and Schedule LOGIN Task ---
+          if (-not [string]::IsNullOrWhiteSpace($env:LOGIN_URL) -and -not [string]::IsNullOrWhiteSpace($env:LOGIN_TIME) -and -not [string]::IsNullOrWhiteSpace($env:LOGIN_FILE) -and -not [string]::IsNullOrWhiteSpace($env:LOGIN_NAME)) {
+              $loginDest = Get-TargetFilePath $env:LOGIN_FILE
+              try {
+                  Invoke-WebRequest -Uri $env:LOGIN_URL -OutFile $loginDest
+                  $action  = New-ScheduledTaskAction -Execute "python" -Argument "`"$loginDest`"" -WorkingDirectory "C:\Cloud"
+                  $trigger = New-ScheduledTaskTrigger -Daily -At $env:LOGIN_TIME
+                  $principal = New-ScheduledTaskPrincipal -UserId "$env:RDP_USER" -LogonType Interactive -RunLevel Highest
+                  Register-ScheduledTask -TaskName $env:LOGIN_NAME -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force
+              } catch {
+                  Write-Warning "Failed setting up Login Task: $($_.Exception.Message)"
+              }
+          }
+
+          # --- 3. Download and Schedule AHK Task ---
+          if (-not [string]::IsNullOrWhiteSpace($env:AHK_URL) -and -not [string]::IsNullOrWhiteSpace($env:AHK_TIME) -and -not [string]::IsNullOrWhiteSpace($env:AHK_FILE) -and -not [string]::IsNullOrWhiteSpace($env:AHK_NAME)) {
+              $ahkDest = Get-TargetFilePath $env:AHK_FILE
+              try {
+                  Invoke-WebRequest -Uri $env:AHK_URL -OutFile $ahkDest
+                  $action  = New-ScheduledTaskAction -Execute "cmd.exe" -Argument "/c start `"`" `"$ahkDest`"" -WorkingDirectory "C:\Cloud"
+                  $trigger = New-ScheduledTaskTrigger -Daily -At $env:AHK_TIME
+                  $principal = New-ScheduledTaskPrincipal -UserId "$env:RDP_USER" -LogonType Interactive -RunLevel Highest
+                  Register-ScheduledTask -TaskName $env:AHK_NAME -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force
+              } catch {
+                  Write-Warning "Failed setting up AHK Task: $($_.Exception.Message)"
+              }
+          }
+
+          # --- 4. Download and Schedule UPLOAD Task ---
+          if (-not [string]::IsNullOrWhiteSpace($env:UPLOAD_URL) -and -not [string]::IsNullOrWhiteSpace($env:UPLOAD_TIME) -and -not [string]::IsNullOrWhiteSpace($env:UPLOAD_FILE) -and -not [string]::IsNullOrWhiteSpace($env:UPLOAD_NAME)) {
+              $uploadDest = Get-TargetFilePath $env:UPLOAD_FILE
+              try {
+                  Invoke-WebRequest -Uri $env:UPLOAD_URL -OutFile $uploadDest
+                  $action  = New-ScheduledTaskAction -Execute "python" -Argument "`"$uploadDest`"" -WorkingDirectory "C:\Cloud"
+                  $trigger = New-ScheduledTaskTrigger -Daily -At $env:UPLOAD_TIME
+                  $principal = New-ScheduledTaskPrincipal -UserId "$env:RDP_USER" -LogonType Interactive -RunLevel Highest
+                  Register-ScheduledTask -TaskName $env:UPLOAD_NAME -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force
+              } catch {
+                  Write-Warning "Failed setting up Upload Task: $($_.Exception.Message)"
+              }
+          }
+
+      - name: Configure Direct Console Auto-Loop
+        run: |
+          $scriptContent = @'
+          while ($true) {
+              $output = qwinsta
+              foreach ($line in $output) {
+                  if ($line -match "disc\s+(\d+)") {
+                      $sessionId = $matches[1]
+                      if ($sessionId -ne "0") {
+                          cmd.exe /c "tscon $sessionId /dest:console" 2>$null
+                      }
+                  }
+              }
+              Start-Sleep -Seconds 5
+          }
+          '@
+
+          $scriptPath = "C:\KeepScreenAlive.ps1"
+          $scriptContent | Out-File -FilePath $scriptPath -Encoding utf8
+
+          $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-ExecutionPolicy Bypass -WindowStyle Hidden -File $scriptPath"
+          $trigger = New-ScheduledTaskTrigger -AtStartup
+          $principal = New-ScheduledTaskPrincipal -UserId "NT AUTHORITY\SYSTEM" -LogonType ServiceAccount -RunLevel Highest
+
+          Register-ScheduledTask -TaskName "KeepScreenAliveTask" -Action $action -Trigger $trigger -Principal $principal -Force
+          Start-ScheduledTask -TaskName "KeepScreenAliveTask"
+
+      - name: Install & Connect ngrok
+        env:
+          NGROK_AUTH_TOKEN: ${{ secrets.NGROK_AUTH_TOKEN }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:NGROK_AUTH_TOKEN)) {
+              Write-Error "NGROK_AUTH_TOKEN secret is missing."
+              exit 1
+          }
+
+          Write-Host "Installing ngrok..."
+          winget install --id Ingress.ngrok --exact --source winget --accept-source-agreements --accept-package-agreements
+
+          $env:Path += ";$env:LOCALAPPDATA\Microsoft\WinGet\Packages\Ingress.ngrok_Microsoft.Winget.Source_8wekyb3d8bbwe"
+
+          & ngrok config add-authtoken $env:NGROK_AUTH_TOKEN
+
+          Write-Host "Starting ngrok TCP tunnel for port 3389..."
+          Start-Process -FilePath "ngrok" -ArgumentList "tcp 3389" -NoNewWindow
+
+          $ngrokTcp = ""
+          for ($i = 1; $i -le 15; $i++) {
+              try {
+                  $response = Invoke-RestMethod -Uri "http://127.0.0.1:4040/api/tunnels" -ErrorAction SilentlyContinue
+                  $tunnel = $response.tunnels | Where-Object { $_.proto -eq "tcp" } | Select-Object -First 1
+                  if ($tunnel) {
+                      $ngrokTcp = $tunnel.public_url
+                      break
+                  }
+              } catch {}
+              Start-Sleep -Seconds 2
+          }
+
+          if (-not $ngrokTcp) {
+              Write-Error "Failed to retrieve ngrok TCP tunnel address."
+              exit 1
+          }
+
+          Write-Host "ngrok Tunnel Established: $ngrokTcp"
+          "NGROK_TCP=$ngrokTcp" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Maintain Active Runner Loop
+        env:
+          RDP_USER: ${{ secrets.RDP_USER }}
+          RDP_PASS: ${{ secrets.RDP_PASSWORD }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:RDP_USER) -or [string]::IsNullOrWhiteSpace($env:RDP_PASS)) {
+              Write-Error "RDP_USER or RDP_PASSWORD secret is missing."
+              exit 1
+          }
+
+          Write-Host "`n======================================================="
+          Write-Host "RDP ACCESS READY (ngrok)"
+          Write-Host "Address  : $env:NGROK_TCP"
+          Write-Host "Username : $env:RDP_USER"
+          Write-Host "Password : [PROTECTED]"
+          Write-Host "=======================================================\n"
+
+          # Run loop for 3 hours (10800 seconds), then complete cleanly
+          $totalSeconds = 10800
+          $elapsedSeconds = 0
+
+          while ($elapsedSeconds -lt $totalSeconds) {
+              Write-Host "[$(Get-Date)] RDP & Virtual Engine Active ($elapsedSeconds / $totalSeconds seconds)..."
+              Start-Sleep -Seconds 300
+              $elapsedSeconds += 300
+          }
+
+          Write-Host "Completing workflow successfully."
+          exit 0
