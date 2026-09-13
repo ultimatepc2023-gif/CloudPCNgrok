@@ -283,15 +283,24 @@ jobs:
               exit 1
           }
 
-          Write-Host "Installing ngrok..."
-          winget install --id Ingress.ngrok --exact --source winget --accept-source-agreements --accept-package-agreements
+          Write-Host "Downloading and installing ngrok manually..."
+          $ngrokZip = "$env:TEMP\ngrok.zip"
+          $ngrokDir = "C:\ngrok"
+          New-Item -ItemType Directory -Path $ngrokDir -Force | Out-Null
 
-          $env:Path += ";$env:LOCALAPPDATA\Microsoft\WinGet\Packages\Ingress.ngrok_Microsoft.Winget.Source_8wekyb3d8bbwe"
+          # Download official ngrok Windows 64-bit binary
+          [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+          Invoke-WebRequest -Uri "https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-windows-amd64.zip" -OutFile $ngrokZip
+          Expand-Archive -Path $ngrokZip -DestinationPath $ngrokDir -Force
 
-          & ngrok config add-authtoken $env:NGROK_AUTH_TOKEN
+          # Add ngrok to process PATH
+          $env:Path += ";$ngrokDir"
+
+          # Configure authtoken
+          & "$ngrokDir\ngrok.exe" config add-authtoken $env:NGROK_AUTH_TOKEN
 
           Write-Host "Starting ngrok TCP tunnel for port 3389..."
-          Start-Process -FilePath "ngrok" -ArgumentList "tcp 3389" -NoNewWindow
+          Start-Process -FilePath "$ngrokDir\ngrok.exe" -ArgumentList "tcp 3389" -NoNewWindow
 
           $ngrokTcp = ""
           for ($i = 1; $i -le 15; $i++) {
